@@ -513,26 +513,35 @@ struct Index {
   }
   private async writeFile(id: number, name: string, bytes: ArrayBuffer): Promise<void> {
     try {
+      // 文档目录直接子文件：直接原子发布。
       if (this.documents !== undefined && this.documents.owns(name)) {
         await this.documents.write(name, bytes);
         native.reply(id, true, name, new ArrayBuffer(0));
         return;
       }
+      // save-as 目标：经 saveTargets 解析真实 URI 后写入。
       let uri = this.saveTargets.take(name);
-      if (uri === undefined) throw new Error('No system save target for ' + name);
-      let file = await fileIo.open(uri, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE);
-      try {
-        await fileIo.truncate(file.fd, 0);
-        let offset = 0;
-        while (offset < bytes.byteLength) {
-          let chunk = bytes.slice(offset, Math.min(offset + 1024 * 1024, bytes.byteLength));
-          let written = await fileIo.write(file.fd, chunk);
-          if (written <= 0) throw new Error('Incomplete file write');
-          offset += written;
-        }
-        await fileIo.fsync(file.fd);
-      } finally { await fileIo.close(file); }
-      native.reply(id, true, name, new ArrayBuffer(0));
+      if (uri !== undefined) {
+        let file = await fileIo.open(uri, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE);
+        try {
+          await fileIo.truncate(file.fd, 0);
+          let offset = 0;
+          while (offset < bytes.byteLength) {
+            let chunk = bytes.slice(offset, Math.min(offset + 1024 * 1024, bytes.byteLength));
+            let written = await fileIo.write(file.fd, chunk);
+            if (written <= 0) throw new Error('Incomplete file write');
+            offset += written;
+          }
+          await fileIo.fsync(file.fd);
+        } finally { await fileIo.close(file); }
+        native.reply(id, true, name, new ArrayBuffer(0));
+        return;
+      }
+      // 无 save-as 目标（downloads 路径传入裸文档名）：落到应用文档目录，自动避让重名。
+      if (this.documents === undefined) throw new Error('Document directory unavailable');
+      let target = await this.documents.available(name);
+      await this.documents.write(target, bytes);
+      native.reply(id, true, target, new ArrayBuffer(0));
     } catch (error) {
       let failure = error as Error;
       native.reply(id, false, failure.message, new ArrayBuffer(0));

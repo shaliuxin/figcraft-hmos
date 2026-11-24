@@ -321,7 +321,7 @@ pub unsafe extern "C" fn pc_drop_file(text: *const u8, n: usize, fd: i32, _x: f3
     let Some(text) = (unsafe { bytes(text, n) }) else {
         return;
     };
-    open_file(None, String::from_utf8_lossy(text).into_owned(), fd);
+    unsafe { open_file(None, String::from_utf8_lossy(text).into_owned(), fd) };
 }
 
 /// # Safety
@@ -332,7 +332,7 @@ pub unsafe extern "C" fn pc_reply_file(id: u64, text: *const u8, n: usize, fd: i
         bridge::reply(id, Err("Invalid file name buffer".into()));
         return;
     };
-    open_file(Some(id), String::from_utf8_lossy(text).into_owned(), fd);
+    unsafe { open_file(Some(id), String::from_utf8_lossy(text).into_owned(), fd) };
 }
 
 /// # Safety
@@ -343,7 +343,7 @@ pub unsafe extern "C" fn pc_open_file(text: *const u8, n: usize, fd: i32) {
         bridge::notify(0, "error", "Invalid file name buffer", &[]);
         return;
     };
-    open_file(None, String::from_utf8_lossy(text).into_owned(), fd);
+    unsafe { open_file(None, String::from_utf8_lossy(text).into_owned(), fd) };
 }
 
 #[cfg(target_env = "ohos")]

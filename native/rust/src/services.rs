@@ -84,4 +84,16 @@ impl Services for HostServices {
     fn system_dark(&self) -> Option<bool> {
         self.system_dark
     }
+
+    // 保存/导出字节交付：figcraft 引擎唯一的下载点。downloads()=true 让 save_as_dialog
+    // 走 download 路径（移动端无保存对话框，不走 pick_save 分支）；download 把字节经
+    // "write" 通知交给 ArkTS 写入文档目录（见 Index.ets writeFile 的裸文档名回退）。
+    // notify 是 fire-and-forget，写入在 ArkTS 主线程异步完成，故直接返回 true。
+    fn download(&mut self, name: &str, bytes: &[u8]) -> bool {
+        bridge::notify(0, "write", name, bytes);
+        true
+    }
+    fn downloads(&self) -> bool {
+        true
+    }
 }
