@@ -86,11 +86,20 @@ impl Services for HostServices {
     }
 
     // 保存/导出字节交付：figcraft 引擎唯一的下载点。downloads()=true 让 save_as_dialog
-    // 走 download 路径（移动端无保存对话框，不走 pick_save 分支）；download 把字节经
-    // "write" 通知交给 ArkTS 写入文档目录（见 Index.ets writeFile 的裸文档名回退）。
-    // notify 是 fire-and-forget，写入在 ArkTS 主线程异步完成，故直接返回 true。
+    // 与各导出面板走 download 路径（移动端不走 pick_save 分支）。download 采用参照项目
+    // 的「picker → 授权 URI」两段式：
+    //   第一段——阻塞式 save_select：弹出系统「另存为」对话框，用户选定位置后把其授权 URI
+    //   登记为逻辑键（见 Index.ets selectSave → SaveTargets.select，返回键经 reply 回到这里）；
+    //   第二段——write 通知：把字节交给 ArkTS，按该键经 saveTargets.take 解析回授权 URI 落盘，
+    //   文件最终出现在用户可见、可验证的位置（共享文档目录 / 云盘）。
+    // 用户在对话框取消时回退裸文档名，由 writeFile 落到沙箱文件目录，保证导出链路始终产出
+    // 文件。write 是 fire-and-forget（id=0），落盘在 ArkTS 侧异步完成，故这里直接返回 true。
     fn download(&mut self, name: &str, bytes: &[u8]) -> bool {
-        bridge::notify(0, "write", name, bytes);
+        let key = match bridge::request("save_select", name, &[]) {
+            Ok((key, _)) => key,
+            Err(_) => name.to_string(),
+        };
+        bridge::notify(0, "write", &key, bytes);
         true
     }
     fn downloads(&self) -> bool {

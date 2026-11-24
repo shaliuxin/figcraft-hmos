@@ -537,10 +537,14 @@ struct Index {
         native.reply(id, true, name, new ArrayBuffer(0));
         return;
       }
-      // 无 save-as 目标（downloads 路径传入裸文档名）：落到应用文档目录，自动避让重名。
+      // 无 save-as 目标（downloads 路径传入裸文档名）：共享 Download 目录需 picker 授权，
+      // 新裸路径不可直接写；先落沙箱文件目录（始终可写）保证导出链路完整产出文件，
+      // 用户可经"另存为"系统选择器改到共享位置。
       if (this.documents === undefined) throw new Error('Document directory unavailable');
-      let target = await this.documents.available(name);
-      await this.documents.write(target, bytes);
+      let sandbox = this.context.filesDir;
+      this.documents.grantOutput(sandbox);
+      let target = sandbox + '/' + name;
+      await this.documents.writeOutput(target, bytes);
       native.reply(id, true, target, new ArrayBuffer(0));
     } catch (error) {
       let failure = error as Error;

@@ -38,6 +38,7 @@ _icon_backup/
 
 # Local verification / scratch
 /work/
+/.shots/
 __pycache__/
 *.pyc
 *.bak
