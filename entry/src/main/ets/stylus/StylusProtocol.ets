@@ -1,0 +1,81 @@
+// Platform-independent host contract. Keep in sync with docs/stylus-input.md.
+export const STYLUS_PROTOCOL_VERSION: number = 1;
+
+export enum StylusEventType {
+  Pointer = 'pointer',
+  BarrelButton = 'barrelButton',
+  Gesture = 'gesture',
+  Connection = 'connection'
+}
+
+export enum StylusAction {
+  DoubleTap = 'doubleTap',
+  Squeeze = 'squeeze'
+}
+
+export enum StylusPointerSource {
+  Mouse = 'mouse',
+  Pen = 'pen',
+  Touch = 'touch'
+}
+
+export class StylusSample {
+  pressure: number = 1;
+  tiltX: number = 0;
+  tiltY: number = 0;
+  rotation: number = 0;
+  eraser: boolean = false;
+}
+
+export class StylusPacket {
+  version: number = STYLUS_PROTOCOL_VERSION;
+  type: StylusEventType;
+  gesture?: StylusAction;
+  timestampMs?: number;
+  connected?: boolean;
+  deviceName?: string;
+  source?: StylusPointerSource;
+  sample?: StylusSample | null;
+  pressed?: boolean;
+
+  constructor(type: StylusEventType) {
+    this.type = type;
+  }
+
+  static action(action: StylusAction, timestampMs: number): StylusPacket {
+    let packet = new StylusPacket(StylusEventType.Gesture);
+    packet.gesture = action;
+    packet.timestampMs = timestampMs;
+    return packet;
+  }
+
+  static connection(connected: boolean, deviceName?: string): StylusPacket {
+    let packet = new StylusPacket(StylusEventType.Connection);
+    packet.connected = connected;
+    if (connected) {
+      packet.deviceName = deviceName;
+    }
+    return packet;
+  }
+
+  static pointer(source: StylusPointerSource, sample: StylusSample | null): StylusPacket {
+    let packet = new StylusPacket(StylusEventType.Pointer);
+    packet.source = source;
+    packet.sample = sample;
+    return packet;
+  }
+
+  static barrelButton(pressed: boolean, timestampMs: number): StylusPacket {
+    let packet = new StylusPacket(StylusEventType.BarrelButton);
+    packet.pressed = pressed;
+    packet.timestampMs = timestampMs;
+    return packet;
+  }
+}
+
+export interface StylusAdapter {
+  start(): void;
+  stop(): void;
+  // Publish current connection state again after the native consumer reconnects.
+  publishState(): void;
+}

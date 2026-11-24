@@ -1,0 +1,93 @@
+{
+  "UniformDataTypeDeclarations": [
+    {
+      "TypeId": "io.github.shaliuxin.figcraft.hmos.figcraft",
+      "BelongingToTypes": [
+        "general.document"
+      ],
+      "FilenameExtensions": [
+        ".figcraft"
+      ],
+      "MIMETypes": [
+        "application/x-figcraft"
+      ],
+      "Description": "FigCraft document",
+      "ReferenceURL": ""
+    },
+    {
+      "TypeId": "io.github.shaliuxin.figcraft.hmos.fig",
+      "BelongingToTypes": [
+        "general.document"
+      ],
+      "FilenameExtensions": [
+        ".fig"
+      ],
+      "MIMETypes": [
+        "application/x-figma"
+      ],
+      "Description": "Figma document",
+      "ReferenceURL": ""
+    },
+    {
+      "TypeId": "io.github.shaliuxin.figcraft.hmos.svg",
+      "BelongingToTypes": [
+        "general.image"
+      ],
+      "FilenameExtensions": [
+        ".svg"
+      ],
+      "MIMETypes": [
+        "image/svg+xml"
+      ],
+      "Description": "Scalable Vector Graphics",
+      "ReferenceURL": ""
+    },
+    {
+      "TypeId": "io.github.shaliuxin.figcraft.hmos.webp",
+      "BelongingToTypes": [
+        "general.image"
+      ],
+      "FilenameExtensions": [
+        ".webp"
+      ],
+      "MIMETypes": [
+        "image/webp"
+      ],
+      "Description": "WebP image",
+      "ReferenceURL": ""
+    },
+    {
+      "TypeId": "io.github.shaliuxin.figcraft.hmos.heif",
+      "BelongingToTypes": [
+        "general.image"
+      ],
+      "FilenameExtensions": [
+        ".heic",
+        ".heif",
+        ".hif"
+      ],
+      "MIMETypes": [
+        "image/heic",
+        "image/heif"
+      ],
+      "Description": "HEIF image",
+      "ReferenceURL": ""
+    },
+    {
+      "TypeId": "io.github.shaliuxin.figcraft.hmos.psb",
+      "BelongingToTypes": [
+        "com.adobe.photoshop-image"
+      ],
+      "FilenameExtensions": [
+        ".psb",
+        ".psdt"
+      ],
+      "MIMETypes": [
+        "image/vnd.adobe.photoshop",
+        "application/x-photoshop"
+      ],
+      "Description": "Photoshop large document and template",
+      "ReferenceURL": ""
+    }
+  ]
+}

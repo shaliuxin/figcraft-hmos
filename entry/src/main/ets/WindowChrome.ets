@@ -1,0 +1,139 @@
+import { window } from '@kit.ArkUI';
+import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
+import { LOADING_CHROME, paintDecorForChrome, paintWindow } from './SystemBars';
+
+const TITLE_HEIGHT: number = 38;
+
+export class WindowChrome {
+  private win: window.Window;
+  private watching: boolean = false;
+  private retries: number[] = [];
+  // 矩形事件可早于窗口状态更新；先采用事件值，再延迟查询稳定后的几何信息。
+  private rectChanged = (rect: window.TitleButtonRect): void => { this.publish(rect); this.refresh(); };
+  // Status / size 回调签名不同，必须分开注册，否则 ArkTS overload 无法匹配 windowSizeChange。
+  private statusChanged = (_status: window.WindowStatusType): void => {
+    this.onLayoutSignal();
+  };
+  private sizeChanged = (_size: window.Size): void => {
+    this.onLayoutSignal();
+  };
+
+  constructor(win: window.Window) { this.win = win; }
+
+  start(): void {
+    if (deviceInfo.deviceType !== '2in1' && deviceInfo.deviceType !== 'tablet') { return; }
+    try {
+      // Listeners must register even when decor APIs fail outside freeform; otherwise a later
+      // freeform entry never refreshes title-button clearance.
+      this.win.on('windowTitleButtonRectChange', this.rectChanged);
+      this.win.on('windowStatusChange', this.statusChanged);
+      this.win.on('windowSizeChange', this.sizeChanged);
+      this.watching = true;
+      this.applyDecor();
+      this.repaintChrome();
+      this.refresh();
+    } catch (error) {
+      let failure = error as BusinessError;
+      console.info(`Integrated title bar unavailable: ${failure.code} ${failure.message}`);
+      this.clear();
+    }
+  }
+
+  refresh(): void {
+    if (!this.watching) { return; }
+    this.cancelRetries();
+    this.readRect();
+    // Window status, size and caption geometry can arrive in separate transactions.
+    // Freeform entry may need longer than a size change before the three-button rect is ready.
+    for (let delay of [50, 200, 600, 1200]) {
+      this.retries.push(setTimeout((): void => {
+        if (!this.watching) { return; }
+        this.readRect();
+        // 2in1 starts floating and its caption may not accept setDecorButtonStyle until the
+        // window is shown (1300002); a later system theme flip also resets it. Re-assert.
+        this.repaintDecor();
+      }, delay));
+    }
+  }
+
+  private onLayoutSignal(): void {
+    // 切入自由多窗时系统才露出三键区；先重套 decor，再刷主题色与几何。
+    this.applyDecor();
+    this.repaintChrome();
+    this.refresh();
+  }
+
+  private repaintChrome(): void {
+    if (!this.watching) { return; }
+    // setDecorButtonStyle often no-ops or fails outside freeform. Re-apply the current
+    // theme chrome when layout changes so tablet → freeform matches a cold freeform start.
+    let color = AppStorage.get<string>('figcraftChrome') ?? LOADING_CHROME;
+    paintWindow(this.win, color);
+  }
+
+  private repaintDecor(): void {
+    paintDecorForChrome(this.win, AppStorage.get<string>('figcraftChrome') ?? LOADING_CHROME);
+  }
+
+  private applyDecor(): void {
+    if (!this.watching) { return; }
+    try {
+      // Keep the native caption buttons and border; merge content into the title bar.
+      this.win.setWindowDecorHeight(TITLE_HEIGHT);
+      this.win.setWindowDecorVisible(false);
+      // Let the system own dragging and double-click maximize for the integrated caption area.
+      this.win.setWindowTitleMoveEnabled(true);
+    } catch (error) {
+      // Outside freeform these often throw 1300002 / 801; keep listening and retry on status change.
+      let failure = error as BusinessError;
+      console.info(`Integrated title bar decor unavailable: ${failure.code} ${failure.message}`);
+    }
+  }
+
+  private readRect(): void {
+    try { this.publish(this.win.getTitleButtonRect()); }
+    catch (error) { /* A transient query failure must not erase the last valid inset. */ }
+  }
+
+  private cancelRetries(): void {
+    // 新一轮刷新替换旧计时器，销毁窗口时也调用，避免回调访问已失效的 Window。
+    for (let timer of this.retries) { clearTimeout(timer); }
+    this.retries = [];
+  }
+
+  private publish(rect: window.TitleButtonRect): void {
+    let status = this.win.getWindowStatus();
+    let free = status === window.WindowStatusType.FLOATING || status === window.WindowStatusType.MAXIMIZE;
+    let visible = Number.isFinite(rect.width) && Number.isFinite(rect.height) && rect.width > 0 && rect.height > 0;
+    // A valid caption rectangle is authoritative even when the status event is lagging.
+    // Empty geometry during a floating/maximized transition retains the previous inset.
+    if (!visible && free) { return; }
+    let right = visible ? rect.width + 8 : 0;
+    let height = visible ? TITLE_HEIGHT : 0;
+    AppStorage.setOrCreate('figcraftTitleRight', right);
+    AppStorage.setOrCreate('figcraftTitleHeight', height);
+    console.info(`FigCraft title bar: status=${status}, rect=${JSON.stringify(rect)}, right=${right}, height=${height}`);
+  }
+
+  private clear(): void {
+    AppStorage.setOrCreate('figcraftTitleRight', 0);
+    AppStorage.setOrCreate('figcraftTitleHeight', 0);
+  }
+
+  stop(): void {
+    this.cancelRetries();
+    if (!this.watching) { return; }
+    this.win.off('windowTitleButtonRectChange', this.rectChanged);
+    this.win.off('windowStatusChange', this.statusChanged);
+    this.win.off('windowSizeChange', this.sizeChanged);
+    this.watching = false;
+    this.clear();
+  }
+}
+
+export function moveWindow(win: window.Window): Promise<void> { return win.startMoving(); }
+
+export function toggleWindowMaximize(win: window.Window): Promise<void> {
+  return win.getWindowStatus() === window.WindowStatusType.FLOATING ?
+    win.maximize(window.MaximizePresentation.EXIT_IMMERSIVE) : win.recover();
+}

@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "FigCraft entry module",
+  "main": "",
+  "author": "",
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {"libfigcraft.so": "file:./src/main/cpp/types/libfigcraft"}
+}

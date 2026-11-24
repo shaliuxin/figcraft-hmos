@@ -1,0 +1,524 @@
+#include <ace/xcomponent/native_interface_xcomponent.h>
+#include <native_window/external_window.h>
+#include <native_vsync/native_vsync.h>
+#include <napi/native_api.h>
+#include <hilog/log.h>
+#include <arkui/ui_input_event.h>
+#include <atomic>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
+#include "display_color.h"
+
+// Called exclusively on the Rust render worker, after EGL creates/configures the surface.
+// Read back the declaration so the editor never emits P3 into an untagged surface.
+extern "C" int32_t pc_set_window_color_space(void* window, bool p3) {
+    auto* nativeWindow = static_cast<OHNativeWindow*>(window);
+    const auto requested = p3 ? OH_COLORSPACE_P3_FULL : OH_COLORSPACE_SRGB_FULL;
+    int32_t result = OH_NativeWindow_SetColorSpace(nativeWindow, requested);
+    OH_NativeBuffer_ColorSpace actual = OH_COLORSPACE_NONE;
+    if (result == 0) result = OH_NativeWindow_GetColorSpace(nativeWindow, &actual);
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft",
+        "Native output requested %{public}d actual %{public}d result %{public}d",
+        static_cast<int>(requested), static_cast<int>(actual), result);
+    return result != 0 ? result : (FigCraftOutputMatches(p3, actual) ? 0 : -1);
+}
+
+extern "C" {
+using Notify = void (*)(uint64_t,const uint8_t*,size_t,const uint8_t*,size_t);
+bool pc_init(const uint8_t*,size_t,Notify);
+void pc_attach(uintptr_t,uint32_t,uint32_t);
+void pc_resize(uint32_t,uint32_t);
+void pc_win_attach(uint32_t,uintptr_t,uint32_t,uint32_t);
+void pc_win_resize(uint32_t,uint32_t,uint32_t);
+void pc_win_detach(uint32_t);
+void pc_detach();
+void pc_frame();
+void pc_active(bool);
+void pc_close();
+void pc_input(const uint8_t*,size_t);
+void pc_reply(uint64_t,bool,const uint8_t*,size_t,const uint8_t*,size_t);
+void pc_open(const uint8_t*,size_t,const uint8_t*,size_t);
+void pc_reply_file(uint64_t,const uint8_t*,size_t,int32_t);
+void pc_open_file(const uint8_t*,size_t,int32_t);
+void pc_drop_file(const uint8_t*,size_t,int32_t,float,float);
+void pc_drop(const uint8_t*,size_t,const uint8_t*,size_t,float,float);
+void pc_command(const uint8_t*,size_t);
+}
+namespace {
+std::mutex notifyMutex;
+napi_threadsafe_function notifyFn = nullptr;
+OH_NativeVSync* vsync = nullptr;
+std::atomic<bool> framePending(false);
+std::atomic<bool> attached(false);
+// Contact bookkeeping is per XComponent: the main window (key 0) and every native sub-window
+// (floating document window, key > 0) have independent pointer ownership.
+struct WinState {
+    uint32_t key=0;
+    std::atomic<int32_t> touchId{-1};
+    std::atomic<bool> penContact{false};
+    std::atomic<bool> fingerContact{false};
+    std::set<int32_t> palmIds;
+};
+std::mutex winMutex;
+std::map<OH_NativeXComponent*,std::shared_ptr<WinState>> windows;
+// XComponent callbacks all run on the ArkUI thread; the active window tags outgoing input.
+thread_local WinState* cur=nullptr;
+WinState* Enter(OH_NativeXComponent* c) {
+    std::lock_guard<std::mutex> lock(winMutex);
+    auto it=windows.find(c);
+    cur=it==windows.end()?nullptr:it->second.get();
+    return cur;
+}
+struct Request {uint64_t id;std::string json;std::vector<uint8_t> data;};
+// 在 ArkTS 线程消费并释放请求；Rust 回调中的借用数据已由 NotifyRust 复制。
+void CallJS(napi_env env,napi_value callback,void*,void* ptr) {
+    auto* r=static_cast<Request*>(ptr);
+    if (env && callback) {
+        napi_value args[3],result,receiver;
+        napi_create_double(env,static_cast<double>(r->id),&args[0]);
+        napi_create_string_utf8(env,r->json.data(),r->json.size(),&args[1]);
+        void* data=nullptr;
+        napi_create_arraybuffer(env,r->data.size(),&data,&args[2]);
+        if (!r->data.empty()) std::memcpy(data,r->data.data(),r->data.size());
+        napi_get_undefined(env,&receiver);
+        if (napi_call_function(env,receiver,callback,3,args,&result)!=napi_ok && r->id) {
+            const std::string error="platform callback failed";
+            pc_reply(r->id,false,reinterpret_cast<const uint8_t*>(error.data()),error.size(),nullptr,0);
+        }
+    } else if(r->id) {
+        const std::string error="cancelled";
+        pc_reply(r->id,false,reinterpret_cast<const uint8_t*>(error.data()),error.size(),nullptr,0);
+    }
+    delete r;
+}
+void NotifyRust(uint64_t id,const uint8_t* json,size_t n,const uint8_t* data,size_t size) {
+    // Rust worker 不直接调用 JS，通过线程安全队列将平台请求交给 ArkTS 主线程。
+    auto* r=new Request{id,std::string(reinterpret_cast<const char*>(json),n),{}};
+    // IME snapshots contain user text and can arrive on every cursor movement.
+    if(r->json.find("\"kind\":\"ime\"")==std::string::npos)
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft", "Rust notification %{public}s", r->json.c_str());
+    if(size) r->data.assign(data,data+size);
+    std::lock_guard<std::mutex> lock(notifyMutex);
+    if(!notifyFn || napi_call_threadsafe_function(notifyFn,r,napi_tsfn_nonblocking)!=napi_ok) {
+        delete r;
+        if(id) {const std::string error="cancelled";pc_reply(id,false,reinterpret_cast<const uint8_t*>(error.data()),error.size(),nullptr,0);}
+    }
+}
+// VSync 只发帧消息，实际 egui 更新和 GPU 绘制仍由 Rust worker 串行执行。
+void Vsync(long long,void*) {framePending=false;if(attached)pc_frame();}
+std::string String(napi_env env,napi_value v) {
+    size_t len=0;
+    if(!v || napi_get_value_string_utf8(env,v,nullptr,0,&len)!=napi_ok || len>1024*1024)return {};
+    std::vector<char> data(len+1);
+    if(napi_get_value_string_utf8(env,v,data.data(),data.size(),&len)!=napi_ok)return {};
+    return std::string(data.data(),len);
+}
+napi_value Undefined(napi_env env){napi_value v;napi_get_undefined(env,&v);return v;}
+void Json(const std::string& s) {
+    // Sub-window input carries its window key so Rust routes it to that viewport.
+    if(cur && cur->key!=0 && s.size()>1 && s[0]=='{') {
+        const std::string tagged="{\"win\":"+std::to_string(cur->key)+","+s.substr(1);
+        pc_input(reinterpret_cast<const uint8_t*>(tagged.data()),tagged.size());
+        return;
+    }
+    pc_input(reinterpret_cast<const uint8_t*>(s.data()),s.size());
+}
+void SurfaceCreated(OH_NativeXComponent* c,void* window) {
+    auto* state=Enter(c);
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft", "Surface created window=%{public}u", state?state->key:0u);
+    if(!state) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, 0xD001, "FigCraft",
+            "SurfaceCreated with no WinState (registerWindow missing or too late)");
+        return;
+    }
+    uint64_t w=0,h=0;
+    if(!window||OH_NativeXComponent_GetXComponentSize(c,window,&w,&h)!=OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, 0xD001, "FigCraft",
+            "SurfaceCreated size failed window=%{public}u", state->key);
+        return;
+    }
+    auto ref=OH_NativeWindow_NativeObjectReference(window);
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft", "Window %{public}llu x %{public}llu reference %{public}d key=%{public}u", static_cast<unsigned long long>(w),static_cast<unsigned long long>(h),ref,state->key);
+    if(ref!=0) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, 0xD001, "FigCraft",
+            "NativeObjectReference failed %{public}d key=%{public}u", ref, state->key);
+        return;
+    }
+    // 将取得的原生窗口引用转交 Rust 的 Window；后者负责在 surface 释放后解除引用。
+    if(state->key!=0) {
+        pc_win_attach(state->key,reinterpret_cast<uintptr_t>(window),static_cast<uint32_t>(w),static_cast<uint32_t>(h));
+        return;
+    }
+    attached=true;
+    pc_attach(reinterpret_cast<uintptr_t>(window),static_cast<uint32_t>(w),static_cast<uint32_t>(h));
+}
+void SurfaceChanged(OH_NativeXComponent* c,void* window) {
+    auto* state=Enter(c);
+    if(!state)return;
+    uint64_t w=0,h=0;
+    if(OH_NativeXComponent_GetXComponentSize(c,window,&w,&h)!=OH_NATIVEXCOMPONENT_RESULT_SUCCESS)return;
+    if(state->key!=0)pc_win_resize(state->key,static_cast<uint32_t>(w),static_cast<uint32_t>(h));
+    else pc_resize(static_cast<uint32_t>(w),static_cast<uint32_t>(h));
+}
+void SurfaceDestroyed(OH_NativeXComponent* c,void*) {
+    auto* state=Enter(c);
+    if(!state)return;
+    state->touchId=-1;state->penContact=false;state->fingerContact=false;state->palmIds.clear();
+    if(state->key!=0){pc_win_detach(state->key);return;}
+    attached=false;pc_detach();
+}
+void Touch(OH_NativeXComponent* c,void* window) {
+    constexpr double palmAreaThreshold=0.65;
+    auto* state=Enter(c);
+    if(!state)return;
+    auto& touchId=state->touchId;auto& penContact=state->penContact;auto& fingerContact=state->fingerContact;
+    OH_NativeXComponent_TouchEvent e{};
+    if(OH_NativeXComponent_GetTouchEvent(c,window,&e)!=OH_NATIVEXCOMPONENT_RESULT_SUCCESS)return;
+    uint32_t index=0;
+    while(index<e.numPoints && index<OH_NATIVE_XCOMPONENT_MAX_TOUCH_POINTS_NUMBER && e.touchPoints[index].id!=e.id)++index;
+    OH_NativeXComponent_TouchPointToolType tool=OH_NATIVEXCOMPONENT_TOOL_TYPE_FINGER;
+    if(index<e.numPoints && index<OH_NATIVE_XCOMPONENT_MAX_TOUCH_POINTS_NUMBER)
+        OH_NativeXComponent_GetTouchPointToolType(c,index,&tool);
+    bool pen=tool==OH_NATIVEXCOMPONENT_TOOL_TYPE_PEN || tool==OH_NATIVEXCOMPONENT_TOOL_TYPE_RUBBER ||
+             tool==OH_NATIVEXCOMPONENT_TOOL_TYPE_BRUSH || tool==OH_NATIVEXCOMPONENT_TOOL_TYPE_PENCIL ||
+             tool==OH_NATIVEXCOMPONENT_TOOL_TYPE_AIRBRUSH;
+    if(!pen) {
+        if(e.type==OH_NATIVEXCOMPONENT_CANCEL) {
+            fingerContact=false;
+            state->palmIds.clear();
+            if(!penContact)Json("{\"kind\":\"blur\"}");
+            return;
+        }
+        std::string points;
+        std::set<int32_t> activeFingers;
+        for(uint32_t i=0;i<e.numPoints && i<OH_NATIVE_XCOMPONENT_MAX_TOUCH_POINTS_NUMBER;++i) {
+            const auto& point=e.touchPoints[i];
+            OH_NativeXComponent_TouchPointToolType pointTool=OH_NATIVEXCOMPONENT_TOOL_TYPE_FINGER;
+            OH_NativeXComponent_GetTouchPointToolType(c,i,&pointTool);
+            // isPressed is false on MOVE in the simulator; use event phases for contact lifetime.
+            if(pointTool!=OH_NATIVEXCOMPONENT_TOOL_TYPE_FINGER ||
+               point.type==OH_NATIVEXCOMPONENT_UP || point.type==OH_NATIVEXCOMPONENT_CANCEL ||
+               (point.id==e.id && e.type==OH_NATIVEXCOMPONENT_UP) ||
+               !std::isfinite(point.x) || !std::isfinite(point.y))continue;
+            activeFingers.insert(point.id);
+            // XComponent supplies a contact-area value. Some devices report zero or an
+            // unnormalized scale; leave those contacts alone until calibrated on hardware.
+            // Once a large contact is rejected, keep its ID rejected until lift: its area
+            // can shrink while the hand rolls, which must not turn it into a sidebar tap.
+            // Classify at DOWN. Removing an already accepted finger on MOVE would
+            // synthesize a release in the Rust adapter and could click the panel.
+            if(point.id==e.id && e.type==OH_NATIVEXCOMPONENT_DOWN &&
+               std::isfinite(point.size) && point.size>=palmAreaThreshold && point.size<=1.0)
+                state->palmIds.insert(point.id);
+            if(state->palmIds.count(point.id))continue;
+            if(!points.empty())points+=",";
+            points+="{\"id\":"+std::to_string(static_cast<uint32_t>(point.id))+",\"x\":"+std::to_string(point.x)+",\"y\":"+std::to_string(point.y)+"}";
+        }
+        for(auto it=state->palmIds.begin();it!=state->palmIds.end();) {
+            if(!activeFingers.count(*it))it=state->palmIds.erase(it);
+            else ++it;
+        }
+        // Keep compatibility mouse events from a resting palm out of the editor.
+        fingerContact=!activeFingers.empty();
+        Json("{\"kind\":\"touch\",\"points\":["+points+"]}");
+        return;
+    }
+    int action=2;
+    if(e.type==OH_NATIVEXCOMPONENT_DOWN){
+        if(touchId!=-1) {
+            if(!pen || penContact)return;
+            // A palm must never prevent a pen from taking ownership of the canvas.
+            Json("{\"kind\":\"pointer\",\"action\":3}");
+        }
+        touchId=e.id;penContact=pen;action=0;
+    }
+    else if(e.type==OH_NATIVEXCOMPONENT_UP)action=1;
+    else if(e.type==OH_NATIVEXCOMPONENT_CANCEL)action=3;
+    if(touchId!=e.id)return;
+    float tiltX=0,tiltY=0;
+    if(pen && index<e.numPoints && index<OH_NATIVE_XCOMPONENT_MAX_TOUCH_POINTS_NUMBER) {
+        OH_NativeXComponent_GetTouchPointTiltX(c,index,&tiltX);
+        OH_NativeXComponent_GetTouchPointTiltY(c,index,&tiltY);
+    }
+    auto finite=[](float value,float fallback){return std::isfinite(value)?value:fallback;};
+    std::string sample=pen ? "{\"pressure\":"+std::to_string(std::clamp(finite(e.force,1),0.0f,1.0f))+
+        ",\"tiltX\":"+std::to_string(finite(tiltX,0))+",\"tiltY\":"+std::to_string(finite(tiltY,0))+
+        ",\"eraser\":"+(tool==OH_NATIVEXCOMPONENT_TOOL_TYPE_RUBBER?"true":"false")+"}" : "null";
+    Json("{\"kind\":\"pointer\",\"source\":\""+std::string(pen?"pen":"touch")+"\",\"sample\":"+sample+
+         ",\"action\":"+std::to_string(action)+",\"x\":"+std::to_string(e.x)+",\"y\":"+std::to_string(e.y)+"}");
+    if(action==1||action==3){touchId=-1;penContact=false;}
+}
+void Mouse(OH_NativeXComponent* c,void* window) {
+    auto* state=Enter(c);
+    if(!state)return;
+    if(state->penContact || state->fingerContact)return;
+    OH_NativeXComponent_MouseEvent e{};
+    if(OH_NativeXComponent_GetMouseEvent(c,window,&e)!=OH_NATIVEXCOMPONENT_RESULT_SUCCESS)return;
+    if(e.action==OH_NATIVEXCOMPONENT_MOUSE_CANCEL){Json("{\"kind\":\"pointer\",\"action\":3}");return;}
+    // Proximity callbacks can expose a cached mouse event with action NONE.
+    // Only actual movement or button events may make the brush tip visible again.
+    if(e.action!=OH_NATIVEXCOMPONENT_MOUSE_PRESS && e.action!=OH_NATIVEXCOMPONENT_MOUSE_RELEASE &&
+       e.action!=OH_NATIVEXCOMPONENT_MOUSE_MOVE)return;
+    int action=e.action==OH_NATIVEXCOMPONENT_MOUSE_PRESS?0:e.action==OH_NATIVEXCOMPONENT_MOUSE_RELEASE?1:2;
+    int button=e.button==OH_NATIVEXCOMPONENT_RIGHT_BUTTON?1:e.button==OH_NATIVEXCOMPONENT_MIDDLE_BUTTON?2:0;
+    Json("{\"kind\":\"pointer\",\"action\":"+std::to_string(action)+",\"button\":"+std::to_string(button)+",\"x\":"+std::to_string(e.x)+",\"y\":"+std::to_string(e.y)+"}");
+}
+bool Key(OH_NativeXComponent* c,void*) {
+    if(!Enter(c))return false;
+    OH_NativeXComponent_KeyEvent* event=nullptr;
+    OH_NativeXComponent_KeyAction action=OH_NATIVEXCOMPONENT_KEY_ACTION_UNKNOWN;
+    OH_NativeXComponent_KeyCode code=static_cast<OH_NativeXComponent_KeyCode>(-1);
+    if(OH_NativeXComponent_GetKeyEvent(c,&event)!=0 || !event ||
+       OH_NativeXComponent_GetKeyEventAction(event,&action)!=0 ||
+       OH_NativeXComponent_GetKeyEventCode(event,&code)!=0)return false;
+    uint64_t modifiers=0;bool caps=false;
+    OH_NativeXComponent_GetKeyEventModifierKeyStates(event,&modifiers);
+    OH_NativeXComponent_GetKeyEventCapsLockState(event,&caps);
+    bool ctrl=modifiers&1,shift=modifiers&2,alt=modifiers&4;
+    int key=static_cast<int>(code);
+    std::string text;
+    if(!ctrl&&!alt&&action==OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN) {
+        if(key>=2017&&key<=2042)text.push_back(static_cast<char>((shift!=caps?'A':'a')+key-2017));
+        else if(key>=2000&&key<=2009)text.push_back(shift?")!@#$%^&*("[key-2000]:static_cast<char>('0'+key-2000));
+        else if(key==2050)text=" ";
+        else {
+            const int codes[]={2043,2044,2056,2057,2058,2059,2060,2061,2062,2063,2064};
+            const char* plain=",.`-=[]\\;'/";
+            const char* shifted="<>~_+{}|:\"?";
+            for(size_t i=0;i<sizeof(codes)/sizeof(codes[0]);++i)if(key==codes[i])text.push_back(shift?shifted[i]:plain[i]);
+        }
+    }
+    if(text=="\\")text="\\\\";
+    else if(text=="\"")text="\\\"";
+    Json("{\"kind\":\"key\",\"action\":"+std::to_string(static_cast<int>(action))+
+         ",\"code\":"+std::to_string(key)+",\"ctrl\":"+(ctrl?"true":"false")+
+         ",\"shift\":"+(shift?"true":"false")+",\"alt\":"+(alt?"true":"false")+
+         ",\"text\":\""+text+"\"}");
+    return true;
+}
+void Axis(OH_NativeXComponent* c,ArkUI_UIInputEvent* event,ArkUI_UIInputEvent_Type type) {
+    auto* state=Enter(c);
+    if(!state)return;
+    if(!event||type!=ARKUI_UIINPUTEVENT_TYPE_AXIS || state->penContact)return;
+    double x=-OH_ArkUI_AxisEvent_GetHorizontalAxisValue(event);
+    double y=-OH_ArkUI_AxisEvent_GetVerticalAxisValue(event);
+    double zoom=OH_ArkUI_AxisEvent_GetPinchAxisScaleValue(event);
+    float px=OH_ArkUI_PointerEvent_GetX(event),py=OH_ArkUI_PointerEvent_GetY(event);
+    if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(px)||!std::isfinite(py))return;
+    if(!std::isfinite(zoom)||zoom<0)zoom=0;
+    Json("{\"kind\":\"axis\",\"action\":"+std::to_string(OH_ArkUI_AxisEvent_GetAxisAction(event))+
+         ",\"x\":"+std::to_string(px)+",\"y\":"+std::to_string(py)+",\"dx\":"+std::to_string(x)+
+         ",\"dy\":"+std::to_string(y)+",\"zoom\":"+std::to_string(zoom)+"}");
+}
+void Blur(OH_NativeXComponent* c,void*) {
+    auto* state=Enter(c);
+    if(!state)return;
+    state->touchId=-1;state->penContact=false;state->fingerContact=false;state->palmIds.clear();Json("{\"kind\":\"blur\"}");
+}
+void Hover(OH_NativeXComponent* c,bool isHover) {
+    auto* state=Enter(c);
+    if(!state)return;
+    // Entry has no position to replay; the next real movement resumes the preview.
+    if(!isHover && !state->penContact && !state->fingerContact)Json("{\"kind\":\"hover_leave\"}");
+}
+OH_NativeXComponent_Callback callbacks{SurfaceCreated,SurfaceChanged,SurfaceDestroyed,Touch};
+OH_NativeXComponent_MouseEvent_Callback mouseCallbacks{Mouse,Hover};
+
+// Register the shared callback set for one XComponent.
+// Main window id is 'figcraft-native' (key 0). Sub-windows use 'pc-win-<N>' and SHOULD pass
+// key explicitly from ArkTS: LocalStorageProp can still be 0 on first build, which used to
+// reject registration (parsed<=0) and leave the sub-window surface forever black.
+bool RegisterComponent(OH_NativeXComponent* c, uint32_t explicit_key) {
+    if(!c)return false;
+    char id[OH_XCOMPONENT_ID_LEN_MAX+1]={0};
+    uint64_t size=OH_XCOMPONENT_ID_LEN_MAX+1;
+    if(OH_NativeXComponent_GetXComponentId(c,id,&size)!=OH_NATIVEXCOMPONENT_RESULT_SUCCESS)return false;
+    uint32_t key=explicit_key;
+    const std::string name(id);
+    const std::string prefix="pc-win-";
+    if(key==0 && name.compare(0,prefix.size(),prefix)==0) {
+        const long parsed=std::strtol(name.c_str()+prefix.size(),nullptr,10);
+        if(parsed<=0||parsed>0x7fffffff) {
+            OH_LOG_Print(LOG_APP, LOG_ERROR, 0xD001, "FigCraft",
+                "Rejecting XComponent id=%{public}s (need key>0)", id);
+            return false;
+        }
+        key=static_cast<uint32_t>(parsed);
+    }
+    {
+        std::lock_guard<std::mutex> lock(winMutex);
+        // A destroyed XComponent's address can be reused by another window: trust the key, and
+        // always re-register callbacks (the object may be new).
+        auto it=windows.find(c);
+        if(it==windows.end()||it->second->key!=key) {
+            auto state=std::make_shared<WinState>();
+            state->key=key;
+            windows[c]=state;
+        } else {
+            it->second->key=key;
+        }
+    }
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft",
+        "Registering XComponent callbacks id=%{public}s window=%{public}u explicit=%{public}u",
+        id, key, explicit_key);
+    OH_NativeXComponent_RegisterCallback(c,&callbacks);
+    OH_NativeXComponent_RegisterMouseEventCallback(c,&mouseCallbacks);
+    OH_NativeXComponent_RegisterKeyEventCallbackWithResult(c,Key);
+    OH_NativeXComponent_RegisterBlurEventCallback(c,Blur);
+    OH_NativeXComponent_RegisterUIInputEventCallback(c,Axis,ARKUI_UIINPUTEVENT_TYPE_AXIS);
+    return true;
+}
+// ArkTS XComponent.onLoad(context[, key]) → bind a sub-window's XComponent to viewport key.
+napi_value RegisterWindow(napi_env env,napi_callback_info info) {
+    size_t n=2;napi_value args[2];napi_get_cb_info(env,info,&n,args,nullptr,nullptr);
+    bool ok=false;
+    uint32_t key=0;
+    if(n>=2) {
+        double value=0;
+        if(napi_get_value_double(env,args[1],&value)==napi_ok && value>0 && value<=0x7fffffff)
+            key=static_cast<uint32_t>(value);
+    }
+    if(n>=1){
+        napi_value value;OH_NativeXComponent* c=nullptr;
+        if(napi_get_named_property(env,args[0],OH_NATIVE_XCOMPONENT_OBJ,&value)==napi_ok&&
+           napi_unwrap(env,value,reinterpret_cast<void**>(&c))==napi_ok)ok=RegisterComponent(c,key);
+    }
+    napi_value result;napi_get_boolean(env,ok,&result);return result;
+}
+napi_value InitHost(napi_env env,napi_callback_info info) {
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft", "Initializing Rust host");
+    size_t n=2;napi_value args[2];napi_get_cb_info(env,info,&n,args,nullptr,nullptr);
+    if(n!=2)return Undefined(env);
+    auto config=String(env,args[0]);
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft", "Config %{public}s", config.c_str());
+    {
+        std::lock_guard<std::mutex> lock(notifyMutex);
+        if(notifyFn)napi_release_threadsafe_function(notifyFn,napi_tsfn_abort);
+        napi_value name;napi_create_string_utf8(env,"FigCraft platform",NAPI_AUTO_LENGTH,&name);
+        auto status=napi_create_threadsafe_function(env,args[1],nullptr,name,0,1,nullptr,nullptr,nullptr,CallJS,&notifyFn);
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft", "TSFN status %{public}d", static_cast<int>(status));
+        if(status!=napi_ok)return Undefined(env);
+        napi_unref_threadsafe_function(env,notifyFn);
+    }
+    if(!vsync)vsync=OH_NativeVSync_Create("FigCraft",10);
+    bool started=pc_init(reinterpret_cast<const uint8_t*>(config.data()),config.size(),NotifyRust);
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft", "Rust started %{public}d", started);
+    if(!started) {
+        const std::string error="Native configuration failed";
+        const std::string json="{\"kind\":\"error\",\"text\":\"Native configuration failed\"}";
+        NotifyRust(0,reinterpret_cast<const uint8_t*>(json.data()),json.size(),nullptr,0);
+    }
+    return Undefined(env);
+}
+napi_value Input(napi_env env,napi_callback_info info) {
+    size_t n=1;napi_value arg;napi_get_cb_info(env,info,&n,&arg,nullptr,nullptr);
+    // Input from ArkTS names its own window; never inherit the last XComponent callback's.
+    cur=nullptr;
+    if(n){auto s=String(env,arg);Json(s);}return Undefined(env);
+}
+napi_value Command(napi_env env,napi_callback_info info) {
+    size_t n=1;napi_value arg;napi_get_cb_info(env,info,&n,&arg,nullptr,nullptr);
+    if(n){auto s=String(env,arg);pc_command(reinterpret_cast<const uint8_t*>(s.data()),s.size());}return Undefined(env);
+}
+napi_value Reply(napi_env env,napi_callback_info info) {
+    size_t n=4;napi_value args[4];napi_get_cb_info(env,info,&n,args,nullptr,nullptr);
+    if(n!=4)return Undefined(env);
+    double id=0;bool ok=false;void* data=nullptr;size_t size=0;
+    napi_get_value_double(env,args[0],&id);napi_get_value_bool(env,args[1],&ok);
+    auto text=String(env,args[2]);napi_get_arraybuffer_info(env,args[3],&data,&size);
+    pc_reply(static_cast<uint64_t>(id),ok,reinterpret_cast<const uint8_t*>(text.data()),text.size(),static_cast<uint8_t*>(data),size);
+    return Undefined(env);
+}
+napi_value Open(napi_env env,napi_callback_info info) {
+    size_t n=2;napi_value args[2];napi_get_cb_info(env,info,&n,args,nullptr,nullptr);
+    if(n!=2)return Undefined(env);
+    auto name=String(env,args[0]);void* data=nullptr;size_t size=0;napi_get_arraybuffer_info(env,args[1],&data,&size);
+    pc_open(reinterpret_cast<const uint8_t*>(name.data()),name.size(),static_cast<uint8_t*>(data),size);return Undefined(env);
+}
+napi_value ReplyFile(napi_env env,napi_callback_info info) {
+    size_t n=3;napi_value args[3];napi_get_cb_info(env,info,&n,args,nullptr,nullptr);
+    if(n!=3)return Undefined(env);
+    double id=0;int32_t fd=-1;
+    napi_get_value_double(env,args[0],&id);napi_get_value_int32(env,args[2],&fd);
+    auto name=String(env,args[1]);
+    // Rust duplicates fd before returning; ArkTS still owns and closes the original.
+    pc_reply_file(static_cast<uint64_t>(id),reinterpret_cast<const uint8_t*>(name.data()),name.size(),fd);
+    return Undefined(env);
+}
+napi_value OpenFile(napi_env env,napi_callback_info info) {
+    size_t n=2;napi_value args[2];napi_get_cb_info(env,info,&n,args,nullptr,nullptr);
+    if(n!=2)return Undefined(env);
+    int32_t fd=-1;napi_get_value_int32(env,args[1],&fd);
+    auto name=String(env,args[0]);
+    pc_open_file(reinterpret_cast<const uint8_t*>(name.data()),name.size(),fd);
+    return Undefined(env);
+}
+napi_value Drop(napi_env env,napi_callback_info info) {
+    size_t n=4;napi_value args[4];napi_get_cb_info(env,info,&n,args,nullptr,nullptr);
+    if(n!=4)return Undefined(env);
+    auto name=String(env,args[0]);void* data=nullptr;size_t size=0;double x=0,y=0;
+    if(napi_get_arraybuffer_info(env,args[1],&data,&size)!=napi_ok ||
+       napi_get_value_double(env,args[2],&x)!=napi_ok || napi_get_value_double(env,args[3],&y)!=napi_ok)return Undefined(env);
+    pc_drop(reinterpret_cast<const uint8_t*>(name.data()),name.size(),static_cast<uint8_t*>(data),size,static_cast<float>(x),static_cast<float>(y));
+    return Undefined(env);
+}
+napi_value DropFile(napi_env env,napi_callback_info info) {
+    size_t n=4;napi_value args[4];napi_get_cb_info(env,info,&n,args,nullptr,nullptr);
+    if(n!=4)return Undefined(env);
+    int32_t fd=-1;double x=0,y=0;
+    if(napi_get_value_int32(env,args[1],&fd)!=napi_ok || napi_get_value_double(env,args[2],&x)!=napi_ok ||
+       napi_get_value_double(env,args[3],&y)!=napi_ok)return Undefined(env);
+    auto name=String(env,args[0]);
+    pc_drop_file(reinterpret_cast<const uint8_t*>(name.data()),name.size(),fd,static_cast<float>(x),static_cast<float>(y));
+    return Undefined(env);
+}
+napi_value Active(napi_env env,napi_callback_info info) {
+    size_t n=1;napi_value arg;bool active=false;napi_get_cb_info(env,info,&n,&arg,nullptr,nullptr);
+    if(n)napi_get_value_bool(env,arg,&active);pc_active(active);return Undefined(env);
+}
+napi_value Close(napi_env env,napi_callback_info){pc_close();return Undefined(env);}
+void Cleanup(void*) {
+    attached=false;pc_active(false);pc_detach();
+    std::lock_guard<std::mutex> lock(notifyMutex);
+    if(notifyFn){napi_release_threadsafe_function(notifyFn,napi_tsfn_abort);notifyFn=nullptr;}
+}
+napi_value Init(napi_env env,napi_value exports) {
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xD001, "FigCraft", "Loading NAPI module");
+    const napi_property_descriptor props[]={
+        {"init",nullptr,InitHost,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"input",nullptr,Input,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"registerWindow",nullptr,RegisterWindow,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"reply",nullptr,Reply,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"open",nullptr,Open,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"replyFile",nullptr,ReplyFile,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"openFile",nullptr,OpenFile,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"dropFile",nullptr,DropFile,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"drop",nullptr,Drop,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"active",nullptr,Active,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"close",nullptr,Close,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"command",nullptr,Command,nullptr,nullptr,nullptr,napi_default,nullptr}
+    };
+    napi_define_properties(env,exports,sizeof(props)/sizeof(props[0]),props);
+    napi_value value;OH_NativeXComponent* c=nullptr;
+    if(napi_get_named_property(env,exports,OH_NATIVE_XCOMPONENT_OBJ,&value)==napi_ok&&napi_unwrap(env,value,reinterpret_cast<void**>(&c))==napi_ok&&c) {
+        RegisterComponent(c,0);
+    }
+    napi_add_env_cleanup_hook(env,Cleanup,nullptr);
+    return exports;
+}
+napi_module module{1,0,nullptr,Init,"figcraft",nullptr,{0}};
+}
+extern "C" void pc_request_vsync() {
+    if(vsync&&attached&&!framePending.exchange(true)) {
+        if(OH_NativeVSync_RequestFrame(vsync,Vsync,nullptr)!=0)framePending=false;
+    }
+}
+extern "C" __attribute__((constructor)) void RegisterFigCraft(){napi_module_register(&module);}

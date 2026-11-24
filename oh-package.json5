@@ -1,0 +1,7 @@
+{
+  "modelVersion": "6.0.0",
+  "description": "FigCraft native egui vector design application for HarmonyOS tablet and PC",
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {},
+  "devDependencies": {}
+}

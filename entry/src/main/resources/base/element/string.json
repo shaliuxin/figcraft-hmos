@@ -1,0 +1,6 @@
+{
+  "string": [
+    { "name": "app_name", "value": "FigCraft" },
+    { "name": "module_description", "value": "FigCraft 矢量设计应用" }
+  ]
+}

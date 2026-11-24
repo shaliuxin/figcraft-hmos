@@ -1,0 +1,11 @@
+# HarmonyOS (OHOS) cross-compilation on Windows.
+#
+# The cc crate cannot spawn the NDK's `*-clang` shell wrappers on Windows, so the
+# C compiler is passed as a .bat wrapper (tools/cc_<arch>.bat) via the CC env var
+# at build time. The archive tool and linker point at the NDK's PE executables.
+
+[target.aarch64-unknown-linux-ohos]
+ar = "C:\\Program Files\\Huawei\\DevEco Studio\\sdk\\default\\openharmony\\native\\llvm\\bin\\llvm-ar.exe"
+
+[target.x86_64-unknown-linux-ohos]
+ar = "C:\\Program Files\\Huawei\\DevEco Studio\\sdk\\default\\openharmony\\native\\llvm\\bin\\llvm-ar.exe"

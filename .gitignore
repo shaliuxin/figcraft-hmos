@@ -1,0 +1,53 @@
+# HarmonyOS / hvigor build outputs
+.hvigor/
+.idea/
+build/
+entry/build/
+oh_modules/
+entry/oh_modules/
+entry/.cxx/
+.clangd-cache/
+
+# Rust build artifacts (huge)
+native/rust/target/
+native/rust/target-*/
+third_party/target/
+
+# Packaged apps
+*.hap
+*.app
+*.hsp
+
+# Signing materials — NEVER commit (passwords / private keys / profiles)
+*.p12
+*.p7b
+*.cer
+*.pem
+build-profile.json5
+/scripts/dev.local.env
+
+# Local test screenshots / crash dumps / build logs / backups
+/*.jpeg
+/*.jpg
+*.dmp
+_build*.log
+_check*.log
+_hvigor*.log
+_rebuild.log
+_icon_backup/
+
+# Local verification / scratch
+/work/
+__pycache__/
+*.pyc
+*.bak
+.DS_Store
+
+# Upstream reference: keep source, drop its build artifacts
+upstream/target/
+upstream/dist/
+upstream/plugins/target/
+
+# IDE / editor
+.vscode/
+*.swp
