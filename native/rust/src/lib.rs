@@ -13,6 +13,7 @@
     clippy::unreachable
 )]
 mod bridge;
+mod file_open;
 mod input;
 mod services;
 #[cfg(target_env = "ohos")]
@@ -256,26 +257,94 @@ pub extern "C" fn pc_close() {
     send(Message::Close);
 }
 
-// The full C++ bridge is reused from the PhotoCraft port. Its sub-window, drag-drop and
-// file-descriptor entry points are inert on a single-window host, so they accept their
-// arguments and do nothing; a later patch wires them through the engine.
+// The C++ bridge reuses the PhotoCraft surface. FigCraft is a single-window host, so the
+// sub-window entry points stay inert. The file-descriptor entry points, however, are the path
+// HarmonyOS actually uses: a picked or dropped file arrives as an open descriptor, so these are
+// wired through the engine below.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_win_attach(_key: u32, _window: usize, _w: u32, _h: u32) {}
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_win_resize(_key: u32, _w: u32, _h: u32) {}
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_win_detach(_key: u32) {}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pc_drop(_text: *const u8, _n: usize, _data: *const u8, _len: usize, _x: f32, _y: f32) {}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pc_drop_file(_text: *const u8, _n: usize, _fd: i32, _x: f32, _y: f32) {}
-/// A file-descriptor open the host did not use: reply cancelled so a waiter never hangs.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pc_reply_file(id: u64, _text: *const u8, _n: usize, _fd: i32) {
-    bridge::reply(id, Err("cancelled".into()));
+
+/// Duplicate the platform's descriptor, then read the bytes on a side thread: the render worker
+/// may be blocked on this very picker reply, so reading a large file on it would deadlock.
+unsafe fn open_file(id: Option<u64>, name: String, fd: i32) {
+    let file = match unsafe { file_open::duplicate(fd) } {
+        Ok(file) => file,
+        Err(error) => {
+            finish_file(id, Err(error));
+            return;
+        }
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("figcraft-file-open".into())
+        .spawn(move || finish_file(id, file_open::read(file).map(|data| (name, data))))
+    {
+        finish_file(id, Err(format!("Cannot start file reader: {error}")));
+    }
 }
+
+/// A picked file resolves the pending picker request; a dropped/opened file (no requester) opens
+/// as a new document through the same `Message::Open` path the picker uses.
+fn finish_file(id: Option<u64>, result: bridge::Reply) {
+    if let Some(id) = id {
+        bridge::reply(id, result);
+    } else {
+        match result {
+            Ok((name, data)) => send(Message::Open(name, data)),
+            Err(error) => bridge::notify(0, "error", &error, &[]),
+        }
+    }
+}
+
+/// A dropped file's name and inline bytes; routed through the open path so a dropped document
+/// opens like a picker pick. (Precise canvas placement at `x`/`y` is a later refinement.)
+/// # Safety
+/// Pointer/length pairs must reference valid, readable memory until this call returns.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pc_open_file(_text: *const u8, _n: usize, _fd: i32) {}
+pub unsafe extern "C" fn pc_drop(text: *const u8, n: usize, data: *const u8, len: usize, _x: f32, _y: f32) {
+    if let (Some(text), Some(data)) = (unsafe { bytes(text, n) }, unsafe { bytes(data, len) }) {
+        match copy_bytes(data) {
+            Ok(data) => send(Message::Open(String::from_utf8_lossy(text).into_owned(), data)),
+            Err(error) => bridge::notify(0, "error", &error, &[]),
+        }
+    }
+}
+
+/// A dropped file handed over as a descriptor; duplicated, then read on a side thread.
+/// # Safety
+/// `text`/`n` must be readable and `fd` open until this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_drop_file(text: *const u8, n: usize, fd: i32, _x: f32, _y: f32) {
+    let Some(text) = (unsafe { bytes(text, n) }) else {
+        return;
+    };
+    open_file(None, String::from_utf8_lossy(text).into_owned(), fd);
+}
+
+/// # Safety
+/// `text`/`n` must be readable and `fd` open until this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_reply_file(id: u64, text: *const u8, n: usize, fd: i32) {
+    let Some(text) = (unsafe { bytes(text, n) }) else {
+        bridge::reply(id, Err("Invalid file name buffer".into()));
+        return;
+    };
+    open_file(Some(id), String::from_utf8_lossy(text).into_owned(), fd);
+}
+
+/// # Safety
+/// `text`/`n` must be readable and `fd` open until this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_open_file(text: *const u8, n: usize, fd: i32) {
+    let Some(text) = (unsafe { bytes(text, n) }) else {
+        bridge::notify(0, "error", "Invalid file name buffer", &[]);
+        return;
+    };
+    open_file(None, String::from_utf8_lossy(text).into_owned(), fd);
+}
 
 #[cfg(target_env = "ohos")]
 unsafe extern "C" {
@@ -317,6 +386,9 @@ fn worker(config: Config, rx: mpsc::Receiver<Message>) {
     // The ArkTS host fades the startup overlay only on a `first_frame` notice (Index.ets
     // `revealEditor`). Emit it exactly once, after the first real paint.
     let mut first_frame = true;
+    // Forward egui's final cursor to ArkUI only when it changes (a 2-in-1 pointer device
+    // shows the shape the tool under the pointer needs).
+    let mut cursor_sent: Option<egui::CursorIcon> = None;
     let started = Instant::now();
     let mut events = Vec::new();
     let mut input = input::State::default();
@@ -447,11 +519,32 @@ fn worker(config: Config, rx: mpsc::Receiver<Message>) {
                         viewport.inner_rect = raw.screen_rect;
                         // Drive one egui frame, then paint whatever the scene produced.
                         let output = ctx.run_ui(raw, |ui| fig.ui(ui));
+                        // Collect external-link requests the UI raised this frame (help links,
+                        // "open in browser") and the final cursor icon, before painting consumes
+                        // the output; the host acts on them on its side.
+                        let open_urls: Vec<String> = output
+                            .platform_output
+                            .commands
+                            .iter()
+                            .filter_map(|command| match command {
+                                egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let cursor = output.platform_output.cursor_icon;
                         // Install the bundled CJK face after the app's first-frame `set_fonts`
                         // so it is not overwritten; it sticks from the next frame on.
                         ensure_cjk_font(&ctx);
                         if let Some(r) = render.as_mut() {
                             r.paint(&ctx, output, ppp)?;
+                        }
+                        for url in open_urls {
+                            bridge::notify(0, "url", &url, &[]);
+                        }
+                        // Forward the cursor only when it actually changes.
+                        if cursor_sent != Some(cursor) {
+                            cursor_sent = Some(cursor);
+                            bridge::notify(0, "cursor", &format!("{cursor:?}"), &[]);
                         }
                         // The first real frame is the signal the ArkTS host waits for to fade
                         // the startup overlay and reveal the live editor.
